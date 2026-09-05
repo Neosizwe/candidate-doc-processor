@@ -1,9 +1,9 @@
 streamlit
+pytesseract
 pdfplumber
 pdf2image
-pytesseract
-pillow
-pypdf
 opencv-python-headless
-pandas
 numpy
+pandas
+pypdf
+Pillow
