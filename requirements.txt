@@ -1,5 +1,5 @@
 streamlit
-pytesseract
+easyocr
 pdfplumber
 pdf2image
 opencv-python-headless
