@@ -4,3 +4,4 @@ pdf2image
 pytesseract
 pillow
 pypdf
+opencv-python-headless
