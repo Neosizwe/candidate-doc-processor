@@ -1,8 +1,7 @@
 streamlit
-easyocr
+google-cloud-vision
 pdfplumber
 pdf2image
-opencv-python-headless
 numpy
 pandas
 pypdf
