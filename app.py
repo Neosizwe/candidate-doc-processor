@@ -12,9 +12,9 @@ from PIL import Image
 from pdf2image import convert_from_bytes
 from pypdf import PdfReader, PdfWriter
 
-# 1. Streamlit Configuration
+# 1. Page & Environment Configuration
 st.set_page_config(
-    page_title="Candidate Pack Splitter & Renamer",
+    page_title="Candidate Pack Processor",
     page_icon="📄",
     layout="wide"
 )
@@ -22,28 +22,28 @@ st.set_page_config(
 if os.name == 'nt':
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
-# Strict list of form title/header words that can NEVER be part of a candidate's name
-TITLE_WORDS_BLACKLIST = {
+# Strict blacklist of words that must NEVER appear in candidate names
+HEADER_BLACKLIST = {
     "affidavit", "declaration", "criminal", "record", "status", "undersigned",
-    "bbbe", "certification", "unemployment", "republic", "south", "africa",
+    "bbbe", "bbbee", "certification", "unemployment", "republic", "south", "africa",
     "national", "identity", "card", "senior", "certificate", "awarded",
-    "full", "name", "names", "fication", "check", "residential", "address",
-    "street", "hereby", "confirm", "programme", "seta", "funded"
+    "full", "name", "names", "fication", "check", "or", "see", "fe", "ee", "se",
+    "hereby", "confirm", "department", "home", "affairs", "residential", "address"
 }
 
 
-# 2. Strict Field Extraction Logic
+# 2. Text Cleansing Helpers
 def clean_candidate_name(raw_text):
-    """Cleans extracted name candidate string and ensures no header noise is present."""
+    """Strips header boilerplate and extracts a clean Candidate Name."""
     if not raw_text:
         return None
 
-    # Keep only letters and spaces
+    # Strip out non-alphabetic characters
     cleaned = re.sub(r'[^a-zA-Z\s]', ' ', raw_text)
     words = [w.strip() for w in cleaned.split() if len(w.strip()) > 1]
     
-    # Remove blacklisted header words
-    valid_words = [w for w in words if w.lower() not in TITLE_WORDS_BLACKLIST]
+    # Filter out blacklisted document headers
+    valid_words = [w for w in words if w.lower() not in HEADER_BLACKLIST]
 
     if len(valid_words) >= 2:
         return "_".join([w.capitalize() for w in valid_words[:3]])
@@ -54,7 +54,7 @@ def clean_candidate_name(raw_text):
 
 
 def clean_id_number(raw_id_str):
-    """Cleans OCR digit misreads in 13-digit SA IDs."""
+    """Sanitizes and enforces 13-digit South African ID rules."""
     if not raw_id_str:
         return None
 
@@ -67,17 +67,16 @@ def clean_id_number(raw_id_str):
     return digits if len(digits) == 13 else None
 
 
-def extract_from_smart_id(ocr_text):
-    """Extracts Name and ID directly from Smart ID card layouts."""
+# 3. Document Extractors
+def extract_smart_id(ocr_text):
+    """Targeted parser for Smart ID cards."""
     text_lower = ocr_text.lower()
     if "republic of south africa" not in text_lower and "identity card" not in text_lower:
         return None, None
 
-    # ID Number Search
     id_match = re.search(r'\b(\d{13})\b', ocr_text)
     extracted_id = id_match.group(1) if id_match else None
 
-    # Name Search: Targets text directly on lines following 'Surname' and 'Names'
     surname, names = None, None
     lines = [l.strip() for l in ocr_text.split('\n') if l.strip()]
 
@@ -97,19 +96,18 @@ def extract_from_smart_id(ocr_text):
     return fullname, extracted_id
 
 
-def extract_from_senior_certificate(ocr_text):
-    """Extracts Name from Matric / Senior Certificate layouts."""
+def extract_senior_certificate(ocr_text):
+    """Targeted parser for Senior Certificates / Matric results."""
     match = re.search(r'awarded\s+to\s*\n*\s*([A-Za-z\s]{5,60})', ocr_text, re.IGNORECASE)
     if match:
-        # Take only the immediate first line under 'Awarded to'
         first_line = match.group(1).split('\n')[0]
         return clean_candidate_name(first_line)
     return None
 
 
-def extract_from_affidavits(ocr_text):
-    """Targeted line-by-line extraction for handwritten form fields."""
-    # 1. ID Number Extraction
+def extract_form_details(ocr_text):
+    """Line-restricted extractor for handwritten affidavits and forms."""
+    # 1. ID Number
     id_num = None
     id_match = re.search(r'\b(\d{13})\b', ocr_text)
     if id_match:
@@ -119,31 +117,31 @@ def extract_from_affidavits(ocr_text):
         if fuzzy_match:
             id_num = clean_id_number(fuzzy_match.group(1))
 
-    # 2. Name Extraction - STRICT TARGETING ONLY
+    # 2. Strict Line-Bounded Name Target
     name = None
-
-    # Target Pattern A: "Full Names: <NAME>" or "Full name: <NAME>"
-    fn_match = re.search(r'Full\s*Names?\s*:\s*([^\n]+)', ocr_text, re.IGNORECASE)
+    
+    # Target Pattern A: "Full Names: <Candidate Name>"
+    fn_match = re.search(r'(?:Full\s*Names?|First\s*Names?)\s*[:\-\.]*\s*([^\n]+)', ocr_text, re.IGNORECASE)
     if fn_match:
         name = clean_candidate_name(fn_match.group(1))
 
-    # Target Pattern B: "I, <NAME>," or "I, <NAME> ID"
+    # Target Pattern B: "I, <Candidate Name>, hereby declare..."
     if not name:
-        i_match = re.search(r'I,?\s*([A-Za-z\s]+?)(?:,|\s+ID|\s+hereby)', ocr_text, re.IGNORECASE)
+        i_match = re.search(r'\bI,?\s+([A-Za-z\s]+?)(?:,|\s+ID|\s+identity|\s+hereby|\s+bearing)', ocr_text, re.IGNORECASE)
         if i_match:
             name = clean_candidate_name(i_match.group(1))
 
     return name, id_num
 
 
-# 3. Document Processing Pipeline
+# 4. OCR Execution
 def process_single_page(page_bytes):
+    """Runs PDF/Image OCR and classifies document type."""
     text = ""
     with pdfplumber.open(io.BytesIO(page_bytes)) as pdf:
         if len(pdf.pages) > 0:
             text = pdf.pages[0].extract_text() or ""
 
-    # Denoise & OCR if pdfplumber returns little/no text
     if len(text.strip()) < 30:
         images = convert_from_bytes(page_bytes)
         for img in images:
@@ -154,34 +152,33 @@ def process_single_page(page_bytes):
 
     text_lower = text.lower()
 
-    # Priority 1: Smart ID Document
-    smart_name, smart_id = extract_from_smart_id(text)
+    # Step A: Smart ID
+    smart_name, smart_id = extract_smart_id(text)
     if smart_name or smart_id:
         return smart_name, smart_id, "Smart-ID", True
 
-    # Priority 2: Senior Certificate
-    cert_name = extract_from_senior_certificate(text)
+    # Step B: Senior Certificate
+    cert_name = extract_senior_certificate(text)
     if cert_name:
         return cert_name, None, "Senior-Certificate", True
 
-    # Priority 3: Categorize Affidavits & Form Pages
+    # Step C: Affidavits & Declarations
     doc_type = "Document"
     if "bbbe" in text_lower or "unemployment" in text_lower:
         doc_type = "BBBEE-Unemployment-Affidavit"
     elif "criminal" in text_lower or "declaration of criminal" in text_lower:
         doc_type = "Criminal-Check-Affidavit"
 
-    aff_name, aff_id = extract_from_affidavits(text)
+    aff_name, aff_id = extract_form_details(text)
     return aff_name, aff_id, doc_type, False
 
 
-# 4. Streamlit Application Core
+# 5. Application UI & Flow
 st.title("📄 Candidate Document Pack Splitter")
-st.markdown("Splits multi-page PDFs, anchors candidate identity, and outputs files named as `CandidateName_IDNumber_DocType.pdf`.")
 
 uploaded_files = st.file_uploader("Upload Candidate PDF Packs", type=["pdf"], accept_multiple_files=True)
 
-if uploaded_files and st.button("Process Candidate Packs"):
+if uploaded_files and st.button("Process & Package Files"):
     records = []
     zip_buffer = io.BytesIO()
 
@@ -196,7 +193,7 @@ if uploaded_files and st.button("Process Candidate Packs"):
                 anchor_name, anchor_id = None, None
                 fallback_name, fallback_id = None, None
 
-                # PASS 1: Read all pages in the PDF pack and determine Candidate Identity
+                # Pass 1: Extract details and locate Anchor identity across all pages
                 for p_idx in range(total_pages):
                     writer = PdfWriter()
                     writer.add_page(reader.pages[p_idx])
@@ -220,23 +217,23 @@ if uploaded_files and st.button("Process Candidate Packs"):
 
                     pages_data.append({"idx": p_idx, "bytes": p_bytes, "type": p_type})
 
-                # PASS 2: Establish Single Master Identity for PDF Pack
-                final_candidate_name = anchor_name or fallback_name or "Candidate"
-                final_candidate_id = anchor_id or fallback_id or "NoID"
+                # Pass 2: Establish unified identity for the whole pack
+                final_name = anchor_name or fallback_name or "Candidate"
+                final_id = anchor_id or fallback_id or "NoID"
 
-                # PASS 3: Apply Master Identity to output filenames
+                # Pass 3: Construct output filenames (CandidateName_IDNumber_DocType.pdf)
                 for p in pages_data:
                     suffix = f"_pg{p['idx']+1}" if total_pages > 1 else ""
-                    filename = f"{final_candidate_name}_{final_candidate_id}_{p['type']}{suffix}.pdf"
-                    folder_name = f"{final_candidate_name}_{final_candidate_id}"
+                    filename = f"{final_name}_{final_id}_{p['type']}{suffix}.pdf"
+                    folder_name = f"{final_name}_{final_id}"
 
                     zip_file.writestr(f"{folder_name}/{filename}", p["bytes"])
 
                     records.append({
                         "Source File": uploaded_file.name,
-                        "Page Number": p['idx'] + 1,
-                        "Candidate Name": final_candidate_name,
-                        "ID Number": final_candidate_id,
+                        "Page": p['idx'] + 1,
+                        "Candidate Name": final_name,
+                        "ID Number": final_id,
                         "Document Type": p['type'],
                         "Renamed Output": filename
                     })
@@ -244,7 +241,7 @@ if uploaded_files and st.button("Process Candidate Packs"):
             df = pd.DataFrame(records)
             zip_file.writestr("Processing_Summary.csv", df.to_csv(index=False).encode('utf-8'))
 
-    st.success("Candidate packs successfully processed!")
+    st.success("Candidate packs processed successfully!")
     st.dataframe(df)
 
     st.download_button(
