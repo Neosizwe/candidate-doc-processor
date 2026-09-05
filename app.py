@@ -1,25 +1,39 @@
 import os
 import re
 import io
+import json
 import zipfile
-import cv2
 import numpy as np
 import pandas as pd
 import pdfplumber
-import easyocr
 import streamlit as st
 from PIL import Image
 from pdf2image import convert_from_bytes
 from pypdf import PdfReader, PdfWriter
+from google.cloud import vision
+from google.oauth2 import service_account
 
 st.set_page_config(page_title="Candidate Document Processor", page_icon="📄", layout="wide")
 
-# Initialize EasyOCR once
+# Initialize Google Cloud Vision Client
 @st.cache_resource
-def load_ocr():
-    return easyocr.Reader(['en'], gpu=False)
+def get_vision_client():
+    # 1. Try loading from Streamlit Secrets (for Streamlit Cloud)
+    if "gcp_service_account" in st.secrets:
+        key_info = dict(st.secrets["gcp_service_account"])
+        credentials = service_account.Credentials.from_service_account_info(key_info)
+        return vision.ImageAnnotatorClient(credentials=credentials)
+    
+    # 2. Try loading from local file `gcp_key.json`
+    elif os.path.exists("gcp_key.json"):
+        credentials = service_account.Credentials.from_service_account_file("gcp_key.json")
+        return vision.ImageAnnotatorClient(credentials=credentials)
+    
+    else:
+        st.error("Google Cloud credentials not found! Please provide 'gcp_key.json' or configure Streamlit Secrets.")
+        st.stop()
 
-reader = load_ocr()
+client = get_vision_client()
 
 HEADER_BLACKLIST = {
     "affidavit", "declaration", "criminal", "record", "status", "undersigned",
@@ -54,40 +68,33 @@ def clean_candidate_id(raw_text):
     match = re.search(r'\b(\d{13})\b', digits)
     return match.group(1) if match else (digits if len(digits) == 13 else None)
 
-def extract_with_easyocr(pil_img):
-    img_np = np.array(pil_img.convert('RGB'))
-    
-    # Downscale image slightly to accelerate CPU performance
-    h, w, _ = img_np.shape
-    if max(h, w) > 1500:
-        img_np = cv2.resize(img_np, (int(w * 0.75), int(h * 0.75)), interpolation=cv2.INTER_AREA)
+def extract_with_cloud_vision(pil_img):
+    # Convert PIL Image to byte buffer
+    img_byte_arr = io.BytesIO()
+    pil_img.save(img_byte_arr, format='JPEG')
+    content = img_byte_arr.getvalue()
 
-    results = reader.readtext(img_np, detail=1)
+    image = vision.Image(content=content)
+    # Execute document text detection optimized for handwriting
+    response = client.document_text_detection(image=image)
     
-    full_text = []
+    full_text = response.full_text_annotation.text if response.full_text_annotation else ""
+
+    # Parse targeted fields using label regex
     cand_name = None
     cand_id = None
-    
-    for i, res in enumerate(results):
-        text_str = res[1].strip()
-        full_text.append(text_str)
-        
-        if re.search(r'Full\s*Name|Name', text_str, re.IGNORECASE) and not cand_name:
-            if i + 1 < len(results):
-                cand_name = clean_candidate_name(results[i+1][1])
-                
-        if re.search(r'Identity|ID\s*No|ID\s*Number', text_str, re.IGNORECASE) and not cand_id:
-            if i + 1 < len(results):
-                cand_id = clean_candidate_id(results[i+1][1])
 
-    text_block = " ".join(full_text)
-    
+    name_match = re.search(r'(?:Full\s*Names?|First\s*Names?|Name)\s*[:\-\.]*\s*([A-Za-z\s]{3,35})(?=\n|ID|Identity|Address|$)', full_text, re.IGNORECASE)
+    if name_match:
+        cand_name = clean_candidate_name(name_match.group(1))
+
     if not cand_id:
-        cand_id = clean_candidate_id(text_block)
-    if not cand_name:
-        cand_name = clean_candidate_name(text_block)
+        cand_id = clean_candidate_id(full_text)
         
-    return cand_name, cand_id, text_block
+    if not cand_name:
+        cand_name = clean_candidate_name(full_text)
+
+    return cand_name, cand_id, full_text
 
 def process_single_page(page_bytes):
     images = convert_from_bytes(page_bytes)
@@ -96,7 +103,7 @@ def process_single_page(page_bytes):
 
     pil_img = images[0]
 
-    cand_name, cand_id, text_block = extract_with_easyocr(pil_img)
+    cand_name, cand_id, text_block = extract_with_cloud_vision(pil_img)
 
     text_lower = text_block.lower()
     doc_type = "Document"
@@ -111,7 +118,7 @@ def process_single_page(page_bytes):
 
     return cand_name, cand_id, doc_type
 
-st.title("📄 Candidate Pack Processor")
+st.title("📄 Candidate Pack Processor (Google Vision Engine)")
 
 uploaded_files = st.file_uploader("Upload Candidate PDF Packs", type=["pdf"], accept_multiple_files=True)
 
@@ -119,7 +126,7 @@ if uploaded_files and st.button("Process Documents"):
     records = []
     zip_buffer = io.BytesIO()
 
-    with st.spinner("Analyzing handwriting via EasyOCR..."):
+    with st.spinner("Processing documents via Google Cloud Vision API..."):
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
             for uploaded_file in uploaded_files:
                 reader_pdf = PdfReader(io.BytesIO(uploaded_file.getvalue()))
