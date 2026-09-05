@@ -187,12 +187,31 @@ if uploaded_files and st.button("Process Documents"):
 @st.cache_resource
 def get_vision_client():
     if "gcp_service_account" in st.secrets:
-        # Convert Streamlit AttrDict to a mutable dict
+        # Convert Streamlit AttrDict to a standard dictionary
         key_info = dict(st.secrets["gcp_service_account"])
         
-        # Repair private_key newline formatting
+        # Clean and repair the private key
         if "private_key" in key_info:
-            key_info["private_key"] = key_info["private_key"].replace("\\n", "\n")
+            pk = str(key_info["private_key"]).strip()
+            
+            # Remove literal surrounding quotes if present
+            if (pk.startswith('"') and pk.endswith('"')) or (pk.startswith("'") and pk.endswith("'")):
+                pk = pk[1:-1]
+                
+            # Replace escaped string newlines with actual line breaks
+            pk = pk.replace("\\n", "\n")
+            
+            # Ensure standard PEM structure
+            header = "-----BEGIN PRIVATE KEY-----"
+            footer = "-----END PRIVATE KEY-----"
+            
+            if header in pk and footer in pk:
+                # Extract core key content and format cleanly
+                core = pk.split(header)[1].split(footer)[0].replace(" ", "").strip()
+                # Wrap long base64 string every 64 characters or rejoin cleanly
+                pk = f"{header}\n{core}\n{footer}\n"
+            
+            key_info["private_key"] = pk
             
         credentials = service_account.Credentials.from_service_account_info(key_info)
         return vision.ImageAnnotatorClient(credentials=credentials)
@@ -202,5 +221,5 @@ def get_vision_client():
         return vision.ImageAnnotatorClient(credentials=credentials)
     
     else:
-        st.error("Google Cloud credentials not found in Secrets.")
+        st.error("Google Cloud credentials not found in Secrets or local file.")
         st.stop()
