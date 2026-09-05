@@ -2,6 +2,8 @@ import os
 import re
 import io
 import zipfile
+import cv2
+import numpy as np
 import pandas as pd
 import pytesseract
 import pdfplumber
@@ -12,7 +14,7 @@ from pypdf import PdfReader, PdfWriter
 
 # 1. Page Configuration
 st.set_page_config(
-    page_title="Candidate Document Splitter & Renamer",
+    page_title="Candidate Document Splitter & Cross-Matcher",
     page_icon="📄",
     layout="wide"
 )
@@ -21,7 +23,49 @@ if os.name == 'nt':
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 
-# 2. Document Extraction & Cross-Matching Logic
+# 2. Advanced Preprocessing for Handwritten Text
+def preprocess_for_handwriting(image):
+    """
+    Applies scaling, blurring, and adaptive thresholding to maximize 
+    Tesseract's ability to extract handwritten text and spaced-out numbers.
+    """
+    open_cv_image = np.array(image.convert('L'))
+    
+    # Resize 2x for better character clarity
+    resized = cv2.resize(open_cv_image, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    
+    # Denoise and threshold
+    blurred = cv2.GaussianBlur(resized, (5, 5), 0)
+    thresh = cv2.adaptiveThreshold(
+        blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
+    )
+    
+    return thresh
+
+
+def clean_handwritten_id(id_candidate_str):
+    """
+    Cleans OCR misreads common in handwritten IDs:
+    Converts 'O', 'o', 'Q' -> '0', 'I', 'l', 'i' -> '1', 'S' -> '5', 'B' -> '8'
+    """
+    replacements = {
+        'O': '0', 'o': '0', 'Q': '0',
+        'I': '1', 'l': '1', 'i': '1', '|': '1',
+        'S': '5', 's': '5',
+        'B': '8',
+        'Z': '2', 'z': '2'
+    }
+    cleaned = id_candidate_str
+    for char, digit in replacements.items():
+        cleaned = cleaned.replace(char, digit)
+    
+    # Strip non-digits
+    digits_only = re.sub(r'\D', '', cleaned)
+    if len(digits_only) == 13:
+        return digits_only
+    return None
+
+
 def extract_smart_id_details(ocr_text):
     surname, names = None, None
     lines = [l.strip() for l in ocr_text.split('\n') if l.strip()]
@@ -50,23 +94,23 @@ def extract_smart_id_details(ocr_text):
 
 
 def parse_page_details(ocr_text):
-    """
-    Extracts document type, candidate name, and ID from an individual page.
-    For B-BBEE affidavits, it focuses explicitly on the top half of the text.
-    """
     text_lower = ocr_text.lower()
 
-    # Extract 13-digit SA ID number (handles printed or clear OCR handwritten digits)
+    # 1. Standard 13-digit SA ID Extraction
     id_match = re.search(r'\b(\d{13})\b', ocr_text)
     id_num = id_match.group(1) if id_match else None
 
+    # 2. Fuzzy Extraction for Handwritten ID numbers (e.g., ID.: 0102141451082)
+    if not id_num:
+        fuzzy_id_match = re.search(r'(?:ID|Identity)\s*[\.:\s]*([0-9OiIl|SsBQZ\s]{13,20})', ocr_text, re.IGNORECASE)
+        if fuzzy_id_match:
+            id_num = clean_handwritten_id(fuzzy_id_match.group(1))
+
     # TYPE 1: B-BBEE / Unemployment Affidavit
     if "bbbe" in text_lower or "unemployment" in text_lower or "affidavit" in text_lower:
-        # Focus scan on the upper portion of the page text (first ~800 chars)
-        top_half_text = ocr_text[:800]
+        top_half_text = ocr_text[:1000]
         name = None
 
-        # 1. Primary: Look for "Full name:" or "I, <Name>" in the top region
         line_match = re.search(r'I,?\s*([A-Za-z\s_]{3,50})(?:,|\s+ID|\s+hereby)', top_half_text, re.IGNORECASE)
         if line_match:
             raw_n = line_match.group(1).replace('_', '').strip()
@@ -102,7 +146,6 @@ def parse_page_details(ocr_text):
         extracted_name = extract_smart_id_details(ocr_text)
         return extracted_name, id_num, "Smart-ID"
 
-    # Fallback
     return None, id_num, "Document"
 
 
@@ -112,18 +155,20 @@ def extract_ocr_from_single_pdf(page_pdf_bytes):
         if len(pdf.pages) > 0:
             extracted_text = pdf.pages[0].extract_text() or ""
 
-    if not extracted_text.strip():
-        # Fallback to OCR engine
+    # Run OpenCV handwriting preprocessing if direct text extraction is short or empty
+    if len(extracted_text.strip()) < 50:
         images = convert_from_bytes(page_pdf_bytes)
         for img in images:
-            extracted_text += pytesseract.image_to_string(img) + "\n"
+            processed_img = preprocess_for_handwriting(img)
+            # PSM 6 optimizes Tesseract for uniform blocks of text
+            extracted_text += pytesseract.image_to_string(processed_img, config='--oem 3 --psm 6') + "\n"
 
     return extracted_text
 
 
 # 3. Streamlit Interface UI
 st.title("📄 Candidate Document Splitter & Cross-Matcher")
-st.markdown("Upload documents. Multi-page PDFs are automatically split, analyzed, and cross-matched to apply candidate details across all pages in the file.")
+st.markdown("Upload candidate documents. Multi-page PDFs are automatically split, preprocessed for handwriting recognition, and cross-matched.")
 
 uploaded_files = st.file_uploader(
     "Upload Candidate Documents", 
@@ -136,7 +181,7 @@ if uploaded_files:
         records = []
         zip_buffer = io.BytesIO()
 
-        with st.spinner("Processing documents, extracting metadata, and cross-matching candidates..."):
+        with st.spinner("Processing documents, running handwriting OCR, and cross-matching..."):
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
 
                 for uploaded_file in uploaded_files:
@@ -146,7 +191,6 @@ if uploaded_files:
                         reader = PdfReader(io.BytesIO(file_bytes))
                         total_pages = len(reader.pages)
 
-                        # PHASE 1: Extract details per page & establish PDF-wide candidate profile
                         pdf_pages_data = []
                         file_candidate_name = None
                         file_candidate_id = None
@@ -162,7 +206,6 @@ if uploaded_files:
                             ocr_text = extract_ocr_from_single_pdf(single_page_bytes)
                             page_name, page_id, doc_type = parse_page_details(ocr_text)
 
-                            # Record best candidate metadata found across pages in this PDF
                             if page_name and not file_candidate_name:
                                 file_candidate_name = page_name
                             if page_id and not file_candidate_id:
@@ -176,12 +219,10 @@ if uploaded_files:
                                 "doc_type": doc_type
                             })
 
-                        # PHASE 2: Cross-check & backfill missing metadata using PDF-level profile
                         final_candidate_name = file_candidate_name or "Candidate"
                         final_candidate_id = file_candidate_id or "NoID"
 
                         for pdata in pdf_pages_data:
-                            # Prefer page-specific details; fall back to file-level matched profile
                             matched_name = pdata["page_name"] or final_candidate_name
                             matched_id = pdata["page_id"] or final_candidate_id
                             
@@ -204,9 +245,9 @@ if uploaded_files:
                             })
 
                     else:
-                        # Processing individual image file
                         img = Image.open(io.BytesIO(file_bytes))
-                        ocr_text = pytesseract.image_to_string(img)
+                        processed_img = preprocess_for_handwriting(img)
+                        ocr_text = pytesseract.image_to_string(processed_img, config='--oem 3 --psm 6')
                         name, id_number, doc_type = parse_page_details(ocr_text)
 
                         matched_name = name or "Candidate"
@@ -229,12 +270,11 @@ if uploaded_files:
                             "Document Type": doc_type
                         })
 
-                # Append processing manifest CSV to output zip
                 df = pd.DataFrame(records)
                 csv_bytes = df.to_csv(index=False).encode('utf-8')
                 zip_file.writestr("Processing_Summary.csv", csv_bytes)
 
-        st.success(f"Successfully processed {len(records)} page(s) across uploaded file(s) with cross-page matching!")
+        st.success(f"Successfully processed {len(records)} page(s) across uploaded file(s)!")
         
         st.dataframe(df)
 
