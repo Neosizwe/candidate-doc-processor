@@ -14,7 +14,7 @@ from pypdf import PdfReader, PdfWriter
 
 st.set_page_config(page_title="Candidate Document Processor", page_icon="📄", layout="wide")
 
-# Initialize EasyOCR reader once (loads deep learning weights into memory)
+# Initialize EasyOCR once
 @st.cache_resource
 def load_ocr():
     return easyocr.Reader(['en'], gpu=False)
@@ -57,7 +57,11 @@ def clean_candidate_id(raw_text):
 def extract_with_easyocr(pil_img):
     img_np = np.array(pil_img.convert('RGB'))
     
-    # EasyOCR returns bounding boxes, text strings, and confidence scores
+    # Downscale image slightly to accelerate CPU performance
+    h, w, _ = img_np.shape
+    if max(h, w) > 1500:
+        img_np = cv2.resize(img_np, (int(w * 0.75), int(h * 0.75)), interpolation=cv2.INTER_AREA)
+
     results = reader.readtext(img_np, detail=1)
     
     full_text = []
@@ -68,19 +72,16 @@ def extract_with_easyocr(pil_img):
         text_str = res[1].strip()
         full_text.append(text_str)
         
-        # Look for "Full Names" or "Name" label and take the next detected bounding box
         if re.search(r'Full\s*Name|Name', text_str, re.IGNORECASE) and not cand_name:
             if i + 1 < len(results):
                 cand_name = clean_candidate_name(results[i+1][1])
                 
-        # Look for "Identity" or "ID" label and take adjacent bounding box
         if re.search(r'Identity|ID\s*No|ID\s*Number', text_str, re.IGNORECASE) and not cand_id:
             if i + 1 < len(results):
                 cand_id = clean_candidate_id(results[i+1][1])
 
     text_block = " ".join(full_text)
     
-    # Fallback search if label offsets missed
     if not cand_id:
         cand_id = clean_candidate_id(text_block)
     if not cand_name:
@@ -95,10 +96,8 @@ def process_single_page(page_bytes):
 
     pil_img = images[0]
 
-    # Step 1: Deep Learning Handwriting Extraction
     cand_name, cand_id, text_block = extract_with_easyocr(pil_img)
 
-    # Step 2: Document Categorization
     text_lower = text_block.lower()
     doc_type = "Document"
     if "bbbe" in text_lower or "unemployment" in text_lower:
@@ -112,7 +111,7 @@ def process_single_page(page_bytes):
 
     return cand_name, cand_id, doc_type
 
-st.title("📄 Candidate Pack Processor (EasyOCR Engine)")
+st.title("📄 Candidate Pack Processor")
 
 uploaded_files = st.file_uploader("Upload Candidate PDF Packs", type=["pdf"], accept_multiple_files=True)
 
@@ -120,7 +119,7 @@ if uploaded_files and st.button("Process Documents"):
     records = []
     zip_buffer = io.BytesIO()
 
-    with st.spinner("Analyzing handwriting via Deep Learning Neural Nets..."):
+    with st.spinner("Analyzing handwriting via EasyOCR..."):
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
             for uploaded_file in uploaded_files:
                 reader_pdf = PdfReader(io.BytesIO(uploaded_file.getvalue()))
@@ -178,8 +177,3 @@ if uploaded_files and st.button("Process Documents"):
         file_name="Processed_Candidates.zip",
         mime="application/zip"
     )
-# Downscale image slightly to speed up CPU inference in EasyOCR
-img_np = np.array(pil_img.convert('RGB'))
-h, w, _ = img_np.shape
-if max(h, w) > 1500:
-    img_np = cv2.resize(img_np, (int(w * 0.75), int(h * 0.75)), interpolation=cv2.INTER_AREA)
