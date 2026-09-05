@@ -1,192 +1,73 @@
-import io
-import os
 import re
-import zipfile
-import pdfplumber
-import streamlit as st
-from PIL import Image
-from pdf2image import convert_from_bytes
-import pytesseract
-from pypdf import PdfReader, PdfWriter
 
-st.set_page_config(page_title="Candidate Document Splitter & Organizer", layout="wide")
-
-def extract_text_from_page_bytes(page_pdf_bytes):
+def parse_document_all_types(ocr_text):
     """
-    Extracts text from a single-page PDF.
-    Uses pdfplumber first, falling back to pytesseract OCR if text is sparse.
+    Unified extractor supporting:
+    1. Criminal Record Affidavits
+    2. SA National ID Cards
+    3. B-BBEE / Unemployment Affidavits
+    4. Senior Certificates
     """
-    full_text = ""
-    try:
-        with pdfplumber.open(io.BytesIO(page_pdf_bytes)) as pdf:
-            if len(pdf.pages) > 0:
-                full_text = pdf.pages[0].extract_text() or ""
-    except Exception:
-        full_text = ""
-        
-    # OCR Fallback for scanned/handwritten pages
-    if len(full_text.strip()) < 30:
-        try:
-            images = convert_from_bytes(page_pdf_bytes, dpi=150)
-            if images:
-                full_text = pytesseract.image_to_string(images[0])
-        except Exception as e:
-            st.warning(f"OCR failed on a page: {e}")
-            
-    return full_text
-
-def classify_doctype(text):
-    text_lower = text.lower()
-    if any(k in text_lower for k in ["republic of south africa", "identity document", "identity card", "national identity"]):
-        return "ID"
-    elif any(k in text_lower for k in ["senior certificate", "national senior certificate", "awarded to"]):
-        return "SeniorCertificate"
-    elif any(k in text_lower for k in ["bbbee", "b-bbee", "broad-based black"]):
-        return "BBBEE-Affidavit"
-    elif "unemployment" in text_lower:
-        return "Unemployment-Affidavit"
-    elif "cellphone" in text_lower or "cell phone" in text_lower:
-        return "Cellphone-Affidavit"
-    elif any(k in text_lower for k in ["criminal", "police clearance", "sap69"]):
-        return "Criminal-Check-Affidavit"
-    return "Document"
-
-def extract_id_number(text):
-    match = re.search(r'\b\d{13}\b', text)
-    return match.group(0) if match else None
-
-def extract_fullname(text):
-    cert_match = re.search(r'(?:awarded\s+to|certify\s+that)\s+([A-Z\s]{3,40})', text, re.IGNORECASE)
-    if cert_match:
-        name = cert_match.group(1).strip()
-        return re.sub(r'\s+', '_', name)
+    text_lower = ocr_text.lower()
     
-    affidavit_match = re.search(r'I,?\s+the\s+undersigned\s+([A-Z\s]{3,40})', text, re.IGNORECASE)
-    if affidavit_match:
-        name = affidavit_match.group(1).strip()
-        return re.sub(r'\s+', '_', name)
+    # --- TYPE 1: Criminal Record Affidavit ---
+    if "criminal record status" in text_lower or "declaration of criminal" in text_lower:
+        name, id_num = extract_criminal_affidavit_details(ocr_text)
+        return name, id_num, "Criminal-Check-Affidavit"
 
-    return None
+    # --- TYPE 2: SA Smart ID Card ---
+    elif "national identity card" in text_lower or "republic of south africa" in text_lower:
+        surname, names, id_num = None, None, None
+        lines = [l.strip() for l in ocr_text.split('\n') if l.strip()]
+        
+        for i, line in enumerate(lines):
+            l_lower = line.lower()
+            if "surname:" in l_lower or l_lower == "surname":
+                if i + 1 < len(lines):
+                    surname = re.sub(r'[^a-zA-Z]', '', lines[i + 1]).title()
+            elif "names:" in l_lower or l_lower == "names":
+                if i + 1 < len(lines):
+                    names = re.sub(r'[^a-zA-Z\s]', '', lines[i + 1]).strip().replace(' ', '_').title()
+                    
+        id_match = re.search(r'\b\d{13}\b', ocr_text)
+        id_num = id_match.group(0) if id_match else None
+        
+        fullname = f"{names}_{surname}" if names and surname else (names or surname)
+        return fullname, id_num, "ID"
 
-def split_pdf_file(pdf_bytes):
-    """
-    Splits a multi-page PDF into single-page PDF byte streams.
-    """
-    reader = PdfReader(io.BytesIO(pdf_bytes))
-    single_pages = []
-    
-    for page_idx in range(len(reader.pages)):
-        writer = PdfWriter()
-        writer.add_page(reader.pages[page_idx])
-        
-        page_io = io.BytesIO()
-        writer.write(page_io)
-        page_bytes = page_io.getvalue()
-        
-        single_pages.append(page_bytes)
-        
-    return single_pages
-
-def process_pdf_batch(pdf_bytes_list):
-    """
-    Splits PDFs into pages, runs OCR, extracts metadata,
-    and fills in missing candidate details across pages in the pack.
-    """
-    extracted_records = []
-    
-    # Global fallbacks per uploaded pack/batch
-    batch_candidate_name = None
-    batch_id_number = None
-
-    # Step 1: Extract and classify every page
-    for pdf_bytes in pdf_bytes_list:
-        pages = split_pdf_file(pdf_bytes)
-        
-        for page_bytes in pages:
-            text = extract_text_from_page_bytes(page_bytes)
-            
-            doc_type = classify_doctype(text)
-            id_num = extract_id_number(text)
-            name = extract_fullname(text)
-            
-            if id_num and not batch_id_number:
-                batch_id_number = id_num
-            if name and not batch_candidate_name:
-                batch_candidate_name = name
+    # --- TYPE 3: Unemployment / B-BBEE Affidavit ---
+    elif "unemployment" in text_lower or "bbbee" in text_lower:
+        # Check inline sentence: "I, [Name] , ID.: [ID]"
+        line_match = re.search(r'I,?\s*([A-Za-z\s]{3,40})\s*,?\s*ID', ocr_text, re.IGNORECASE)
+        name = None
+        if line_match:
+            raw_n = line_match.group(1).strip()
+            if len(raw_n) > 2:
+                name = re.sub(r'\s+', '_', re.sub(r'[^a-zA-Z\s]', '', raw_n)).title()
                 
-            extracted_records.append({
-                "page_bytes": page_bytes,
-                "doc_type": doc_type,
-                "id_number": id_num,
-                "candidate_name": name
-            })
-
-    # Step 2: Fill missing candidate names/IDs with batch fallbacks
-    final_records = []
-    for rec in extracted_records:
-        candidate_name = rec["candidate_name"] or batch_candidate_name or "UnknownCandidate"
-        id_number = rec["id_number"] or batch_id_number or "UnknownID"
+        # Check form field fallback: "Full name:"
+        if not name:
+            fn_match = re.search(r'Full\s*name\s*:\s*([A-Za-z\s]{3,40})', ocr_text, re.IGNORECASE)
+            if fn_match:
+                name = re.sub(r'\s+', '_', re.sub(r'[^a-zA-Z\s]', '', fn_match.group(1))).title()
+                
+        id_match = re.search(r'\b\d{13}\b', ocr_text)
+        id_num = id_match.group(0) if id_match else None
         
-        final_records.append({
-            "bytes": rec["page_bytes"],
-            "candidate_name": candidate_name,
-            "id_number": id_number,
-            "doc_type": rec["doc_type"]
-        })
-        
-    return final_records
+        doc_type = "Unemployment-Affidavit" if "unemployment" in text_lower else "BBBEE-Affidavit"
+        return name, id_num, doc_type
 
-# --- Streamlit UI ---
-st.title("Candidate Document Splitter & Organizer")
-
-uploaded_files = st.file_uploader(
-    "Upload multi-page candidate PDF packs or a ZIP file:",
-    type=["pdf", "zip"],
-    accept_multiple_files=True
-)
-
-if uploaded_files and st.button("Split, Rename & Structure Documents"):
-    raw_pdf_streams = []
-    
-    # Collect all PDF streams
-    for uploaded_file in uploaded_files:
-        if uploaded_file.name.endswith(".zip"):
-            with zipfile.ZipFile(uploaded_file, "r") as z:
-                for filename in z.namelist():
-                    if filename.endswith(".pdf") and not filename.startswith("__MACOSX"):
-                        raw_pdf_streams.append(z.read(filename))
-        elif uploaded_file.name.endswith(".pdf"):
-            raw_pdf_streams.append(uploaded_file.read())
-
-    with st.spinner("Splitting PDF pages, running OCR, and organizing files..."):
-        processed_records = process_pdf_batch(raw_pdf_streams)
-
-    # Build output ZIP
-    zip_buffer = io.BytesIO()
-    doc_type_counts = {}
-    
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_out:
-        for idx, rec in enumerate(processed_records):
-            c_name = rec["candidate_name"]
-            id_num = rec["id_number"]
-            d_type = rec["doc_type"]
+    # --- TYPE 4: Senior Certificate ---
+    elif "senior certificate" in text_lower or "awarded to" in text_lower:
+        cert_match = re.search(r'(?:awarded\s+to|certify\s+that)\s+([A-Z\s]{3,40})', ocr_text, re.IGNORECASE)
+        name = None
+        if cert_match:
+            name = re.sub(r'\s+', '_', re.sub(r'[^a-zA-Z\s]', '', cert_match.group(1))).title()
             
-            # Avoid duplicate file name collisions if a candidate has multiple pages of the same doc type
-            doc_key = f"{c_name}_{id_num}_{d_type}"
-            doc_type_counts[doc_key] = doc_type_counts.get(doc_key, 0) + 1
-            suffix = f"_{doc_type_counts[doc_key]}" if doc_type_counts[doc_key] > 1 else ""
-            
-            folder_name = f"{c_name}_{id_num}"
-            new_file_name = f"{c_name}_{id_num}_{d_type}{suffix}.pdf"
-            zip_path = os.path.join(folder_name, new_file_name)
-            
-            zip_out.writestr(zip_path, rec["bytes"])
+        id_match = re.search(r'\b\d{13}\b', ocr_text)
+        id_num = id_match.group(0) if id_match else None
+        return name, id_num, "SeniorCertificate"
 
-    st.success(f"Successfully extracted and split {len(processed_records)} individual documents!")
-    
-    st.download_button(
-        label="Download Structured Zip File",
-        data=zip_buffer.getvalue(),
-        file_name="Structured_Candidate_Documents.zip",
-        mime="application/zip"
-    )
+    # Fallback default
+    id_match = re.search(r'\b\d{13}\b', ocr_text)
+    return None, (id_match.group(0) if id_match else None), "Document"
