@@ -178,3 +178,8 @@ if uploaded_files and st.button("Process Documents"):
         file_name="Processed_Candidates.zip",
         mime="application/zip"
     )
+# Downscale image slightly to speed up CPU inference in EasyOCR
+img_np = np.array(pil_img.convert('RGB'))
+h, w, _ = img_np.shape
+if max(h, w) > 1500:
+    img_np = cv2.resize(img_np, (int(w * 0.75), int(h * 0.75)), interpolation=cv2.INTER_AREA)
