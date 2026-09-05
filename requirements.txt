@@ -5,3 +5,5 @@ pytesseract
 pillow
 pypdf
 opencv-python-headless
+pandas
+numpy
