@@ -5,4 +5,3 @@ pytesseract
 pillow
 pypdf
 opencv-python-headless
-pyarrow==18.1.0
