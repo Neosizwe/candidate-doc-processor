@@ -4,56 +4,41 @@ import re
 import zipfile
 import pdfplumber
 import streamlit as st
-import numpy as np
 from PIL import Image
 from pdf2image import convert_from_bytes
 import pytesseract
-import easyocr
 
-# Cache EasyOCR Reader to avoid reloading weights on every execution
-@st.cache_resource
-def load_easyocr():
-    return easyocr.Reader(['en'], gpu=False)
-
-reader = load_easyocr()
+# Set page config
+st.set_page_config(page_title="Candidate Document Organizer", layout="wide")
 
 def extract_text_hybrid(pdf_bytes):
     """
-    Attempts native digital text extraction via pdfplumber.
-    Falls back to OCR if little to no text is extracted.
+    1. Tries direct PDF text extraction via pdfplumber (Fastest & lowest memory).
+    2. Falls back to Tesseract OCR via pdf2image if text length < 30 chars.
     """
     full_text = ""
     
-    # Strategy 1: Fast native text extraction
+    # 1. Native Digital PDF Extraction
     try:
         with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
             full_text = "\n".join([page.extract_text() or "" for page in pdf.pages])
     except Exception:
         full_text = ""
         
-    # Strategy 2: Fallback to OCR if page yields under 30 characters
+    # 2. Fallback to OCR for Scanned/Handwritten PDFs
     if len(full_text.strip()) < 30:
-        # Convert PDF pages to PIL Images (dpi=200 balances speed and OCR accuracy)
-        images = convert_from_bytes(pdf_bytes, dpi=200)
-        ocr_texts = []
-        
-        for img in images:
-            # Option A: EasyOCR (Recommended for handwritten text)
-            img_np = np.array(img)
-            results = reader.readtext(img_np, detail=0)
-            text_page = " ".join(results)
+        try:
+            images = convert_from_bytes(pdf_bytes, dpi=150) # Low DPI keeps memory low
+            ocr_texts = []
+            for img in images:
+                text_page = pytesseract.image_to_string(img)
+                ocr_texts.append(text_page)
+            full_text = "\n".join(ocr_texts)
+        except Exception as e:
+            st.warning(f"OCR processing failed for a document: {e}")
             
-            # Option B: PyTesseract (Faster alternative for clear scans)
-            # Un-comment the line below if using PyTesseract instead of EasyOCR:
-            # text_page = pytesseract.image_to_string(img)
-            
-            ocr_texts.append(text_page)
-            
-        full_text = "\n".join(ocr_texts)
-        
     return full_text
 
-# Document classification logic
 def classify_doctype(text):
     text_lower = text.lower()
     if any(k in text_lower for k in ["republic of south africa", "identity document", "identity card"]):
@@ -70,20 +55,16 @@ def classify_doctype(text):
         return "Criminal-Check-Affidavit"
     return "Document"
 
-# Extraction using robust regular expressions
 def extract_id_number(text):
     match = re.search(r'\b\d{13}\b', text)
     return match.group(0) if match else "UnknownID"
 
 def extract_fullname(text):
-    # Match names following "awarded to" or "this is to certify that"
     cert_match = re.search(r'(?:awarded\s+to|certify\s+that)\s+([A-Z\s]{3,40})', text, re.IGNORECASE)
     if cert_match:
         name = cert_match.group(1).strip()
-        # Clean up line breaks or multi-spaces
         return re.sub(r'\s+', '_', name)
     
-    # Fallback to Affidavit / ID search patterns (e.g. "I, the undersigned [Name]")
     affidavit_match = re.search(r'I,?\s+the\s+undersigned\s+([A-Z\s]{3,40})', text, re.IGNORECASE)
     if affidavit_match:
         name = affidavit_match.group(1).strip()
@@ -106,9 +87,8 @@ def process_pdf_bytes(pdf_bytes, filename):
         "original_filename": filename
     }
 
-# Streamlit Interface
-st.set_page_config(page_title="Candidate Document OCR Processor", layout="wide")
-st.title("Candidate Document Organizer (OCR Enabled)")
+# App Header
+st.title("Candidate Document Organizer")
 
 uploaded_files = st.file_uploader(
     "Upload PDFs or a ZIP archive (scanned, digital, or handwritten):",
@@ -119,7 +99,7 @@ uploaded_files = st.file_uploader(
 if uploaded_files and st.button("Process & Structure Files"):
     processed_records = []
     
-    with st.spinner("Extracting text and processing documents via OCR..."):
+    with st.spinner("Extracting text and organizing candidate documents..."):
         for uploaded_file in uploaded_files:
             if uploaded_file.name.endswith(".zip"):
                 with zipfile.ZipFile(uploaded_file, "r") as z:
@@ -131,7 +111,7 @@ if uploaded_files and st.button("Process & Structure Files"):
                 pdf_bytes = uploaded_file.read()
                 processed_records.append(process_pdf_bytes(pdf_bytes, uploaded_file.name))
             
-    # Build structured Zip archive
+    # Zip output generation
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_out:
         for rec in processed_records:
@@ -140,10 +120,10 @@ if uploaded_files and st.button("Process & Structure Files"):
             zip_path = os.path.join(folder_name, new_file_name)
             zip_out.writestr(zip_path, rec["bytes"])
             
-    st.success(f"Successfully processed {len(processed_records)} document(s)!")
+    st.success(f"Processed {len(processed_records)} document(s)!")
     
     st.download_button(
-        label="Download Structured Zip Archive",
+        label="Download Structured Zip File",
         data=zip_buffer.getvalue(),
         file_name="Structured_Candidate_Documents.zip",
         mime="application/zip"
