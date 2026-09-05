@@ -1,3 +1,14 @@
+import streamlit as st
+
+# MUST be the first Streamlit command in app.py
+st.set_page_config(
+    page_title="Candidate Document Processor",
+    page_icon="📄",
+    layout="wide"
+)
+
+st.title("Candidate Document Processor")
+st.write("Upload candidate PDFs or images to automatically extract details.")
 import re
 
 def parse_document_all_types(ocr_text):
