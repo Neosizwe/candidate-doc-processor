@@ -8,6 +8,7 @@ import pdfplumber
 import streamlit as st
 from PIL import Image
 from pdf2image import convert_from_bytes
+from pypdf import PdfReader, PdfWriter
 
 # 1. Page Configuration
 st.set_page_config(
@@ -98,30 +99,23 @@ def parse_document(ocr_text):
     return None, (id_match.group(0) if id_match else None), "Document"
 
 
-def process_file(uploaded_file):
-    file_bytes = uploaded_file.getvalue()
+def extract_ocr_from_single_pdf(page_pdf_bytes):
     extracted_text = ""
-    
-    if uploaded_file.type == "application/pdf":
-        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-            for page in pdf.pages:
-                t = page.extract_text()
-                if t:
-                    extracted_text += t + "\n"
-        if not extracted_text.strip():
-            images = convert_from_bytes(file_bytes)
-            for img in images:
-                extracted_text += pytesseract.image_to_string(img) + "\n"
-    else:
-        img = Image.open(io.BytesIO(file_bytes))
-        extracted_text = pytesseract.image_to_string(img)
-        
+    with pdfplumber.open(io.BytesIO(page_pdf_bytes)) as pdf:
+        if len(pdf.pages) > 0:
+            extracted_text = pdf.pages[0].extract_text() or ""
+
+    if not extracted_text.strip():
+        images = convert_from_bytes(page_pdf_bytes)
+        for img in images:
+            extracted_text += pytesseract.image_to_string(img) + "\n"
+
     return extracted_text
 
 
 # 3. Streamlit Interface
-st.title("📄 Candidate Document Batch Processor & Renamer")
-st.markdown("Upload documents to automatically rename them according to candidate details and download a organized ZIP folder.")
+st.title("📄 Candidate Document Splitter & Renamer")
+st.markdown("Upload candidate documents. Multi-page PDFs are automatically split into individual page files, categorized, renamed, and arranged into organized candidate folders.")
 
 uploaded_files = st.file_uploader(
     "Upload Candidate Documents", 
@@ -130,52 +124,94 @@ uploaded_files = st.file_uploader(
 )
 
 if uploaded_files:
-    if st.button("Process & Package Files"):
+    if st.button("Split, Process & Package Files"):
         records = []
         zip_buffer = io.BytesIO()
 
-        with st.spinner("Processing documents and generating ZIP archive..."):
+        with st.spinner("Splitting PDFs and extracting document details..."):
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
-                for idx, file in enumerate(uploaded_files):
-                    ocr_text = process_file(file)
-                    name, id_number, doc_type = parse_document(ocr_text)
+                file_counter = 1
 
-                    # Build renamed file name format: Name_ID_DocType.ext
-                    ext = os.path.splitext(file.name)[1]
-                    clean_name = name or f"Candidate_{idx+1}"
-                    clean_id = id_number or "NoID"
-                    new_filename = f"{clean_name}_{clean_id}_{doc_type}{ext}"
+                for uploaded_file in uploaded_files:
+                    file_bytes = uploaded_file.getvalue()
 
-                    # Define target folder path inside ZIP archive
-                    folder_name = f"{clean_name}_{clean_id}"
-                    zip_path = f"{folder_name}/{new_filename}"
+                    if uploaded_file.type == "application/pdf":
+                        # Split PDF into single pages
+                        reader = PdfReader(io.BytesIO(file_bytes))
+                        total_pages = len(reader.pages)
 
-                    # Write file into the ZIP folder
-                    zip_file.writestr(zip_path, file.getvalue())
+                        for page_idx in range(total_pages):
+                            writer = PdfWriter()
+                            writer.add_page(reader.pages[page_idx])
+                            
+                            single_page_io = io.BytesIO()
+                            writer.write(single_page_io)
+                            single_page_bytes = single_page_io.getvalue()
 
-                    records.append({
-                        "Original Filename": file.name,
-                        "Renamed Filename": new_filename,
-                        "Folder Path": folder_name,
-                        "Extracted Name": name or "Unknown",
-                        "Identity Number": id_number or "Unknown",
-                        "Document Type": doc_type
-                    })
+                            # Extract metadata for individual page
+                            ocr_text = extract_ocr_from_single_pdf(single_page_bytes)
+                            name, id_number, doc_type = parse_document(ocr_text)
 
-                # Include summary CSV report inside the ZIP archive
+                            clean_name = name or f"Candidate_{file_counter}"
+                            clean_id = id_number or "NoID"
+                            page_suffix = f"_pg{page_idx+1}" if total_pages > 1 else ""
+                            new_filename = f"{clean_name}_{clean_id}_{doc_type}{page_suffix}.pdf"
+
+                            folder_name = f"{clean_name}_{clean_id}"
+                            zip_path = f"{folder_name}/{new_filename}"
+
+                            zip_file.writestr(zip_path, single_page_bytes)
+
+                            records.append({
+                                "Source File": uploaded_file.name,
+                                "Page Number": page_idx + 1,
+                                "Renamed Filename": new_filename,
+                                "Folder Path": folder_name,
+                                "Extracted Name": name or "Unknown",
+                                "Identity Number": id_number or "Unknown",
+                                "Document Type": doc_type
+                            })
+                            file_counter += 1
+
+                    else:
+                        # Process image file
+                        img = Image.open(io.BytesIO(file_bytes))
+                        ocr_text = pytesseract.image_to_string(img)
+                        name, id_number, doc_type = parse_document(ocr_text)
+
+                        ext = os.path.splitext(uploaded_file.name)[1]
+                        clean_name = name or f"Candidate_{file_counter}"
+                        clean_id = id_number or "NoID"
+                        new_filename = f"{clean_name}_{clean_id}_{doc_type}{ext}"
+
+                        folder_name = f"{clean_name}_{clean_id}"
+                        zip_path = f"{folder_name}/{new_filename}"
+
+                        zip_file.writestr(zip_path, file_bytes)
+
+                        records.append({
+                            "Source File": uploaded_file.name,
+                            "Page Number": 1,
+                            "Renamed Filename": new_filename,
+                            "Folder Path": folder_name,
+                            "Extracted Name": name or "Unknown",
+                            "Identity Number": id_number or "Unknown",
+                            "Document Type": doc_type
+                        })
+                        file_counter += 1
+
+                # Generate Summary Manifest CSV
                 df = pd.DataFrame(records)
                 csv_bytes = df.to_csv(index=False).encode('utf-8')
                 zip_file.writestr("Processing_Summary.csv", csv_bytes)
 
-        st.success(f"Successfully processed {len(uploaded_files)} document(s)!")
+        st.success(f"Successfully processed and split into {len(records)} individual document file(s)!")
         
-        # Display extraction table
         st.dataframe(df)
 
-        # Download ZIP Folder Button
         st.download_button(
-            label="📥 Download Renamed Files & Folders (.ZIP)",
+            label="📥 Download Split & Renamed Files (.ZIP)",
             data=zip_buffer.getvalue(),
-            file_name="Processed_Candidate_Documents.zip",
+            file_name="Split_Candidate_Documents.zip",
             mime="application/zip"
         )
