@@ -14,7 +14,7 @@ from pypdf import PdfReader, PdfWriter
 
 # 1. Page Configuration
 st.set_page_config(
-    page_title="Candidate Document Splitter & Cross-Matcher",
+    page_title="Candidate Document Pack Splitter",
     page_icon="📄",
     layout="wide"
 )
@@ -23,130 +23,143 @@ if os.name == 'nt':
     pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
 
 
-# 2. Advanced Preprocessing for Handwritten Text
+# 2. Text Preprocessing & Cleaning
 def preprocess_for_handwriting(image):
-    """
-    Applies scaling, blurring, and adaptive thresholding to maximize 
-    Tesseract's ability to extract handwritten text and spaced-out numbers.
-    """
+    """Enhances image contrast for handwriting and faint text OCR."""
     open_cv_image = np.array(image.convert('L'))
-    
-    # Resize 2x for better character clarity
     resized = cv2.resize(open_cv_image, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
-    
-    # Denoise and threshold
     blurred = cv2.GaussianBlur(resized, (5, 5), 0)
     thresh = cv2.adaptiveThreshold(
         blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2
     )
-    
     return thresh
 
 
 def clean_handwritten_id(id_candidate_str):
-    """
-    Cleans OCR misreads common in handwritten IDs:
-    Converts 'O', 'o', 'Q' -> '0', 'I', 'l', 'i' -> '1', 'S' -> '5', 'B' -> '8'
-    """
+    """Fixes digit/letter confusion in handwritten 13-digit SA IDs."""
     replacements = {
         'O': '0', 'o': '0', 'Q': '0',
         'I': '1', 'l': '1', 'i': '1', '|': '1',
-        'S': '5', 's': '5',
-        'B': '8',
-        'Z': '2', 'z': '2'
+        'S': '5', 's': '5', 'B': '8', 'Z': '2', 'z': '2'
     }
     cleaned = id_candidate_str
     for char, digit in replacements.items():
         cleaned = cleaned.replace(char, digit)
     
-    # Strip non-digits
     digits_only = re.sub(r'\D', '', cleaned)
-    if len(digits_only) == 13:
-        return digits_only
-    return None
+    return digits_only if len(digits_only) == 13 else None
 
 
-def extract_smart_id_details(ocr_text):
-    surname, names = None, None
-    lines = [l.strip() for l in ocr_text.split('\n') if l.strip()]
+def sanitize_candidate_name(raw_name):
+    """Filters out form headings and OCR noise from candidate names."""
+    if not raw_name:
+        return None
 
-    for i, line in enumerate(lines):
-        l_lower = line.lower()
-        if "surname" in l_lower and i + 1 < len(lines):
-            next_line = lines[i + 1]
-            if not any(k in next_line.lower() for k in ["names", "sex", "nationality"]):
-                surname = re.sub(r'[^a-zA-Z]', '', next_line).title()
-        
-        if "names" in l_lower and i + 1 < len(lines):
-            next_line = lines[i + 1]
-            if not any(k in next_line.lower() for k in ["sex", "nationality", "country"]):
-                names = re.sub(r'[^a-zA-Z\s]', '', next_line).strip().replace(' ', '_').title()
+    # Common form noise and template headers to ignore
+    noise_patterns = [
+        r'declaration', r'criminal', r'record', r'status', r'affidavit',
+        r'administered', r'capaciti', r'programme', r'participant', r'confirm',
+        r'unemployment', r'certification', r'republic', r'south africa', r'identity'
+    ]
 
-    if not names and not surname:
-        cap_words = re.findall(r'\b[A-Z]{3,20}\b', ocr_text)
-        ignore_words = {"REPUBLIC", "SOUTH", "AFRICA", "NATIONAL", "IDENTITY", "CARD", "SEX", "CITIZEN"}
-        filtered = [w.title() for w in cap_words if w not in ignore_words]
-        if len(filtered) >= 2:
-            names, surname = filtered[0], filtered[1]
+    cleaned_str = re.sub(r'[^a-zA-Z\s]', '', raw_name).strip()
+    words = cleaned_str.split()
 
-    fullname = f"{names}_{surname}" if names and surname else (names or surname)
-    return fullname
+    # Reject if text matches known header patterns or contains fewer than 2 words
+    if len(words) < 2:
+        return None
+
+    lower_check = cleaned_str.lower()
+    for noise in noise_patterns:
+        if noise in lower_check:
+            return None
+
+    return "_".join([w.capitalize() for w in words[:4]])
+
+
+# 3. High-Accuracy Document & Anchor Extractors
+def extract_anchor_document_details(ocr_text):
+    """
+    Extracts Candidate Name & ID from official anchor documents:
+    Smart ID, Green ID Book, and Senior Certificates (Matric).
+    """
+    text_lower = ocr_text.lower()
+    is_anchor = False
+    doc_type = "Document"
+
+    # Detect Official Anchor Document Types
+    if "national identity card" in text_lower or "republic of south africa" in text_lower or "identity document" in text_lower:
+        is_anchor = True
+        doc_type = "ID-Document"
+    elif "senior certificate" in text_lower or "national senior certificate" in text_lower or "matric" in text_lower or "umalusi" in text_lower:
+        is_anchor = True
+        doc_type = "Senior-Certificate"
+
+    # Extract 13-Digit SA ID Number
+    id_match = re.search(r'\b(\d{13})\b', ocr_text)
+    extracted_id = id_match.group(1) if id_match else None
+
+    # Name Extraction for ID Documents
+    extracted_name = None
+    if is_anchor:
+        surname, names = None, None
+        lines = [l.strip() for l in ocr_text.split('\n') if l.strip()]
+
+        for i, line in enumerate(lines):
+            l_lower = line.lower()
+            if "surname" in l_lower and i + 1 < len(lines):
+                next_l = lines[i + 1]
+                if not any(k in next_l.lower() for k in ["names", "sex", "nationality", "date"]):
+                    surname = re.sub(r'[^a-zA-Z]', '', next_l).strip()
+            elif "names" in l_lower and i + 1 < len(lines):
+                next_l = lines[i + 1]
+                if not any(k in next_l.lower() for k in ["sex", "nationality", "country"]):
+                    names = re.sub(r'[^a-zA-Z\s]', '', next_l).strip()
+
+        if surname and names:
+            extracted_name = sanitize_candidate_name(f"{names} {surname}")
+        elif names or surname:
+            extracted_name = sanitize_candidate_name(names or surname)
+
+        # Senior Certificate Name Pattern ("This is to certify that <NAME>...")
+        if not extracted_name and "Senior-Certificate" in doc_type:
+            cert_match = re.search(r'(?:certify that|awarded to)\s+([A-Za-z\s]{5,60})', ocr_text, re.IGNORECASE)
+            if cert_match:
+                extracted_name = sanitize_candidate_name(cert_match.group(1))
+
+    return is_anchor, extracted_name, extracted_id, doc_type
 
 
 def parse_page_details(ocr_text):
+    """Parses individual non-anchor pages (Affidavits, Supporting Docs)."""
     text_lower = ocr_text.lower()
 
-    # 1. Standard 13-digit SA ID Extraction
+    # Identify document type
+    if "bbbe" in text_lower or "unemployment" in text_lower:
+        doc_type = "BBBEE-Unemployment-Affidavit"
+    elif "criminal" in text_lower or "declaration of criminal" in text_lower:
+        doc_type = "Criminal-Check-Affidavit"
+    elif "affidavit" in text_lower:
+        doc_type = "Affidavit"
+    else:
+        doc_type = "Document"
+
+    # Extract ID
     id_match = re.search(r'\b(\d{13})\b', ocr_text)
     id_num = id_match.group(1) if id_match else None
 
-    # 2. Fuzzy Extraction for Handwritten ID numbers (e.g., ID.: 0102141451082)
     if not id_num:
-        fuzzy_id_match = re.search(r'(?:ID|Identity)\s*[\.:\s]*([0-9OiIl|SsBQZ\s]{13,20})', ocr_text, re.IGNORECASE)
-        if fuzzy_id_match:
-            id_num = clean_handwritten_id(fuzzy_id_match.group(1))
+        fuzzy_id = re.search(r'(?:ID|Identity)\s*[\.:\s]*([0-9OiIl|SsBQZ\s]{13,20})', ocr_text, re.IGNORECASE)
+        if fuzzy_id:
+            id_num = clean_handwritten_id(fuzzy_id.group(1))
 
-    # TYPE 1: B-BBEE / Unemployment Affidavit
-    if "bbbe" in text_lower or "unemployment" in text_lower or "affidavit" in text_lower:
-        top_half_text = ocr_text[:1000]
-        name = None
+    # Name fallback from top-half form lines
+    name = None
+    line_match = re.search(r'I,?\s*([A-Za-z\s]{4,40})(?:,|\s+ID|\s+hereby)', ocr_text[:800], re.IGNORECASE)
+    if line_match:
+        name = sanitize_candidate_name(line_match.group(1))
 
-        line_match = re.search(r'I,?\s*([A-Za-z\s_]{3,50})(?:,|\s+ID|\s+hereby)', top_half_text, re.IGNORECASE)
-        if line_match:
-            raw_n = line_match.group(1).replace('_', '').strip()
-            clean_n = re.sub(r'[^a-zA-Z\s]', '', raw_n).strip()
-            if len(clean_n) > 2:
-                name = re.sub(r'\s+', '_', clean_n).title()
-
-        if not name:
-            table_match = re.search(r'Full\s*names?\s*:\s*([A-Za-z\s]{3,60})', top_half_text, re.IGNORECASE)
-            if table_match:
-                raw = table_match.group(1).split('\n')[0].strip()
-                clean = re.sub(r'[^a-zA-Z\s]', '', raw).strip()
-                if len(clean) > 2:
-                    name = re.sub(r'\s+', '_', clean).title()
-
-        doc_type = "BBBEE-Unemployment-Affidavit" if "unemployment" in text_lower or "bbbe" in text_lower else "Affidavit"
-        return name, id_num, doc_type
-
-    # TYPE 2: Criminal Check Affidavit
-    elif "criminal" in text_lower or "declaration" in text_lower:
-        name = None
-        name_match = re.search(r'Full\s*Names?\s*:\s*([A-Za-z\s]{3,50})', ocr_text, re.IGNORECASE)
-        if name_match:
-            raw = name_match.group(1).split('\n')[0].strip()
-            clean = re.sub(r'[^a-zA-Z\s]', '', raw).strip()
-            if len(clean) > 2:
-                name = re.sub(r'\s+', '_', clean).title()
-
-        return name, id_num, "Criminal-Check-Affidavit"
-
-    # TYPE 3: Smart ID Card
-    elif "identity card" in text_lower or "republic of south africa" in text_lower or "smart id" in text_lower:
-        extracted_name = extract_smart_id_details(ocr_text)
-        return extracted_name, id_num, "Smart-ID"
-
-    return None, id_num, "Document"
+    return name, id_num, doc_type
 
 
 def extract_ocr_from_single_pdf(page_pdf_bytes):
@@ -155,33 +168,31 @@ def extract_ocr_from_single_pdf(page_pdf_bytes):
         if len(pdf.pages) > 0:
             extracted_text = pdf.pages[0].extract_text() or ""
 
-    # Run OpenCV handwriting preprocessing if direct text extraction is short or empty
-    if len(extracted_text.strip()) < 50:
+    if len(extracted_text.strip()) < 40:
         images = convert_from_bytes(page_pdf_bytes)
         for img in images:
-            processed_img = preprocess_for_handwriting(img)
-            # PSM 6 optimizes Tesseract for uniform blocks of text
-            extracted_text += pytesseract.image_to_string(processed_img, config='--oem 3 --psm 6') + "\n"
+            proc_img = preprocess_for_handwriting(img)
+            extracted_text += pytesseract.image_to_string(proc_img, config='--oem 3 --psm 6') + "\n"
 
     return extracted_text
 
 
-# 3. Streamlit Interface UI
-st.title("📄 Candidate Document Splitter & Cross-Matcher")
-st.markdown("Upload candidate documents. Multi-page PDFs are automatically split, preprocessed for handwriting recognition, and cross-matched.")
+# 4. Streamlit Application Core
+st.title("📄 Candidate Pack Splitter & Renamer")
+st.markdown("Upload candidate PDF packs. The app detects **ID Documents & Senior Certificates** to establish candidate identity and renames all files and folders in the PDF pack.")
 
 uploaded_files = st.file_uploader(
-    "Upload Candidate Documents", 
+    "Upload Candidate PDF Packs", 
     type=["pdf", "jpg", "jpeg", "png"], 
     accept_multiple_files=True
 )
 
 if uploaded_files:
-    if st.button("Split, Cross-Match & Package Files"):
+    if st.button("Process Candidate Packs"):
         records = []
         zip_buffer = io.BytesIO()
 
-        with st.spinner("Processing documents, running handwriting OCR, and cross-matching..."):
+        with st.spinner("Processing PDF candidate packs and matching anchor documents..."):
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
 
                 for uploaded_file in uploaded_files:
@@ -192,9 +203,13 @@ if uploaded_files:
                         total_pages = len(reader.pages)
 
                         pdf_pages_data = []
-                        file_candidate_name = None
-                        file_candidate_id = None
+                        anchor_candidate_name = None
+                        anchor_candidate_id = None
+                        
+                        fallback_candidate_name = None
+                        fallback_candidate_id = None
 
+                        # PASS 1: Scan entire PDF for anchor documents (ID / Senior Cert)
                         for page_idx in range(total_pages):
                             writer = PdfWriter()
                             writer.add_page(reader.pages[page_idx])
@@ -204,68 +219,76 @@ if uploaded_files:
                             single_page_bytes = single_page_io.getvalue()
 
                             ocr_text = extract_ocr_from_single_pdf(single_page_bytes)
-                            page_name, page_id, doc_type = parse_page_details(ocr_text)
+                            is_anchor, a_name, a_id, doc_type = extract_anchor_document_details(ocr_text)
 
-                            if page_name and not file_candidate_name:
-                                file_candidate_name = page_name
-                            if page_id and not file_candidate_id:
-                                file_candidate_id = page_id
+                            if not is_anchor:
+                                page_name, page_id, doc_type = parse_page_details(ocr_text)
+                                if page_name and not fallback_candidate_name:
+                                    fallback_candidate_name = page_name
+                                if page_id and not fallback_candidate_id:
+                                    fallback_candidate_id = page_id
+                            else:
+                                if a_name and not anchor_candidate_name:
+                                    anchor_candidate_name = a_name
+                                if a_id and not anchor_candidate_id:
+                                    anchor_candidate_id = a_id
 
                             pdf_pages_data.append({
                                 "page_idx": page_idx,
                                 "bytes": single_page_bytes,
-                                "page_name": page_name,
-                                "page_id": page_id,
-                                "doc_type": doc_type
+                                "doc_type": doc_type,
+                                "ocr_name": a_name if is_anchor else page_name,
+                                "ocr_id": a_id if is_anchor else page_id
                             })
 
-                        final_candidate_name = file_candidate_name or "Candidate"
-                        final_candidate_id = file_candidate_id or "NoID"
+                        # PASS 2: Establish Single Master Identity for the PDF Pack
+                        final_pack_name = anchor_candidate_name or fallback_candidate_name or "Candidate"
+                        final_pack_id = anchor_candidate_id or fallback_candidate_id or "NoID"
 
+                        # PASS 3: Apply Master Identity across every page file and directory
                         for pdata in pdf_pages_data:
-                            matched_name = pdata["page_name"] or final_candidate_name
-                            matched_id = pdata["page_id"] or final_candidate_id
-                            
                             page_suffix = f"_pg{pdata['page_idx']+1}" if total_pages > 1 else ""
-                            new_filename = f"{matched_name}_{matched_id}_{pdata['doc_type']}{page_suffix}.pdf"
-
-                            folder_name = f"{matched_name}_{matched_id}"
+                            new_filename = f"{final_pack_name}_{final_pack_id}_{pdata['doc_type']}{page_suffix}.pdf"
+                            folder_name = f"{final_pack_name}_{final_pack_id}"
                             zip_path = f"{folder_name}/{new_filename}"
 
                             zip_file.writestr(zip_path, pdata["bytes"])
 
                             records.append({
-                                "Source File": uploaded_file.name,
+                                "Source PDF Pack": uploaded_file.name,
                                 "Page Number": pdata["page_idx"] + 1,
                                 "Renamed Filename": new_filename,
                                 "Folder Path": folder_name,
-                                "Extracted Name": matched_name,
-                                "Identity Number": matched_id,
+                                "Candidate Name": final_pack_name,
+                                "Identity Number": final_pack_id,
                                 "Document Type": pdata["doc_type"]
                             })
 
                     else:
                         img = Image.open(io.BytesIO(file_bytes))
-                        processed_img = preprocess_for_handwriting(img)
-                        ocr_text = pytesseract.image_to_string(processed_img, config='--oem 3 --psm 6')
-                        name, id_number, doc_type = parse_page_details(ocr_text)
+                        proc_img = preprocess_for_handwriting(img)
+                        ocr_text = pytesseract.image_to_string(proc_img, config='--oem 3 --psm 6')
+                        
+                        is_anchor, name, id_num, doc_type = extract_anchor_document_details(ocr_text)
+                        if not is_anchor:
+                            name, id_num, doc_type = parse_page_details(ocr_text)
 
                         matched_name = name or "Candidate"
-                        matched_id = id_number or "NoID"
+                        matched_id = id_num or "NoID"
                         ext = os.path.splitext(uploaded_file.name)[1]
+                        
                         new_filename = f"{matched_name}_{matched_id}_{doc_type}{ext}"
-
                         folder_name = f"{matched_name}_{matched_id}"
                         zip_path = f"{folder_name}/{new_filename}"
 
                         zip_file.writestr(zip_path, file_bytes)
 
                         records.append({
-                            "Source File": uploaded_file.name,
+                            "Source PDF Pack": uploaded_file.name,
                             "Page Number": 1,
                             "Renamed Filename": new_filename,
                             "Folder Path": folder_name,
-                            "Extracted Name": matched_name,
+                            "Candidate Name": matched_name,
                             "Identity Number": matched_id,
                             "Document Type": doc_type
                         })
@@ -274,13 +297,12 @@ if uploaded_files:
                 csv_bytes = df.to_csv(index=False).encode('utf-8')
                 zip_file.writestr("Processing_Summary.csv", csv_bytes)
 
-        st.success(f"Successfully processed {len(records)} page(s) across uploaded file(s)!")
-        
+        st.success(f"Processed {len(records)} document page(s) into candidate packs!")
         st.dataframe(df)
 
         st.download_button(
-            label="📥 Download Split & Matched Files (.ZIP)",
+            label="📥 Download Structured Candidate Packs (.ZIP)",
             data=zip_buffer.getvalue(),
-            file_name="Cross_Matched_Candidate_Documents.zip",
+            file_name="Candidate_Packs_Processed.zip",
             mime="application/zip"
         )
