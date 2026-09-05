@@ -184,3 +184,23 @@ if uploaded_files and st.button("Process Documents"):
         file_name="Processed_Candidates.zip",
         mime="application/zip"
     )
+@st.cache_resource
+def get_vision_client():
+    if "gcp_service_account" in st.secrets:
+        # Convert Streamlit AttrDict to a mutable dict
+        key_info = dict(st.secrets["gcp_service_account"])
+        
+        # Repair private_key newline formatting
+        if "private_key" in key_info:
+            key_info["private_key"] = key_info["private_key"].replace("\\n", "\n")
+            
+        credentials = service_account.Credentials.from_service_account_info(key_info)
+        return vision.ImageAnnotatorClient(credentials=credentials)
+    
+    elif os.path.exists("gcp_key.json"):
+        credentials = service_account.Credentials.from_service_account_file("gcp_key.json")
+        return vision.ImageAnnotatorClient(credentials=credentials)
+    
+    else:
+        st.error("Google Cloud credentials not found in Secrets.")
+        st.stop()
