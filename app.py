@@ -5,17 +5,21 @@ import zipfile
 import cv2
 import numpy as np
 import pandas as pd
-import pytesseract
 import pdfplumber
+import easyocr
 import streamlit as st
 from PIL import Image
 from pdf2image import convert_from_bytes
 from pypdf import PdfReader, PdfWriter
 
-st.set_page_config(page_title="Candidate Pack Processor", page_icon="📄", layout="wide")
+st.set_page_config(page_title="Candidate Document Processor", page_icon="📄", layout="wide")
 
-if os.name == 'nt':
-    pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# Initialize EasyOCR reader once (loads deep learning weights into memory)
+@st.cache_resource
+def load_ocr():
+    return easyocr.Reader(['en'], gpu=False)
+
+reader = load_ocr()
 
 HEADER_BLACKLIST = {
     "affidavit", "declaration", "criminal", "record", "status", "undersigned",
@@ -25,10 +29,7 @@ HEADER_BLACKLIST = {
     "residential", "address", "hereby", "confirm"
 }
 
-
-# 1. Text Sanitization Helpers
 def clean_candidate_name(raw_text):
-    """Strips title boilerplate and cleans candidate name."""
     if not raw_text:
         return None
     cleaned = re.sub(r'[^a-zA-Z\s]', ' ', str(raw_text))
@@ -41,9 +42,7 @@ def clean_candidate_name(raw_text):
         return filtered[0]
     return None
 
-
 def clean_candidate_id(raw_text):
-    """Sanitizes 13-digit South African ID numbers with character repair."""
     if not raw_text:
         return None
     cleaned = str(raw_text)
@@ -55,70 +54,40 @@ def clean_candidate_id(raw_text):
     match = re.search(r'\b(\d{13})\b', digits)
     return match.group(1) if match else (digits if len(digits) == 13 else None)
 
-
-# 2. Crash-Proof Spatial Layout Extractor
-def extract_fields_by_spatial_layout(pil_img):
-    """
-    Scans word positions using Tesseract OCR data.
-    Finds label positions ('Full Name', 'Identity') and collects all words 
-    printed/written in the same horizontal row to the right.
-    """
+def extract_with_easyocr(pil_img):
     img_np = np.array(pil_img.convert('RGB'))
-    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    
+    # EasyOCR returns bounding boxes, text strings, and confidence scores
+    results = reader.readtext(img_np, detail=1)
+    
+    full_text = []
+    cand_name = None
+    cand_id = None
+    
+    for i, res in enumerate(results):
+        text_str = res[1].strip()
+        full_text.append(text_str)
+        
+        # Look for "Full Names" or "Name" label and take the next detected bounding box
+        if re.search(r'Full\s*Name|Name', text_str, re.IGNORECASE) and not cand_name:
+            if i + 1 < len(results):
+                cand_name = clean_candidate_name(results[i+1][1])
+                
+        # Look for "Identity" or "ID" label and take adjacent bounding box
+        if re.search(r'Identity|ID\s*No|ID\s*Number', text_str, re.IGNORECASE) and not cand_id:
+            if i + 1 < len(results):
+                cand_id = clean_candidate_id(results[i+1][1])
 
-    # Enhance contrast for handwritten ink
-    thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
+    text_block = " ".join(full_text)
+    
+    # Fallback search if label offsets missed
+    if not cand_id:
+        cand_id = clean_candidate_id(text_block)
+    if not cand_name:
+        cand_name = clean_candidate_name(text_block)
+        
+    return cand_name, cand_id, text_block
 
-    # Get OCR word coordinates dataframe
-    data = pytesseract.image_to_data(thresh, output_type=pytesseract.Output.DATAFRAME)
-
-    # FIX FOR STREAMLIT CRASH: Safely convert 'text' column to string before filtering
-    data = data.dropna(subset=['text']).copy()
-    data['text'] = data['text'].astype(str).str.strip()
-    data = data[data['text'] != '']
-
-    if data.empty:
-        return None, None
-
-    found_name = None
-    found_id = None
-
-    # Search for Name Field Label
-    name_labels = data[data['text'].str.contains(r'Name|Names|Full', case=False, regex=True)]
-    if not name_labels.empty:
-        for _, row in name_labels.iterrows():
-            y_top = row['top'] - 15
-            y_bottom = row['top'] + row['height'] + 20
-            x_left = row['left'] + row['width']
-
-            # Capture words on the same horizontal line to the right of label
-            row_words = data[(data['top'] >= y_top) & (data['top'] <= y_bottom) & (data['left'] > x_left)]
-            row_text = " ".join(row_words['text'].tolist())
-            candidate = clean_candidate_name(row_text)
-            if candidate:
-                found_name = candidate
-                break
-
-    # Search for ID Field Label
-    id_labels = data[data['text'].str.contains(r'Identity|ID|Number', case=False, regex=True)]
-    if not id_labels.empty:
-        for _, row in id_labels.iterrows():
-            y_top = row['top'] - 15
-            y_bottom = row['top'] + row['height'] + 25
-            x_left = row['left'] + row['width']
-
-            # Capture words on the same horizontal line to the right
-            row_words = data[(data['top'] >= y_top) & (data['top'] <= y_bottom) & (data['left'] > x_left)]
-            row_text = " ".join(row_words['text'].tolist())
-            candidate_id = clean_candidate_id(row_text)
-            if candidate_id:
-                found_id = candidate_id
-                break
-
-    return found_name, found_id
-
-
-# 3. Page Level Processing
 def process_single_page(page_bytes):
     images = convert_from_bytes(page_bytes)
     if not images:
@@ -126,21 +95,11 @@ def process_single_page(page_bytes):
 
     pil_img = images[0]
 
-    # Step 1: Spatial layout extraction
-    cand_name, cand_id = extract_fields_by_spatial_layout(pil_img)
+    # Step 1: Deep Learning Handwriting Extraction
+    cand_name, cand_id, text_block = extract_with_easyocr(pil_img)
 
-    # Step 2: Full-text fallback parse
-    text = ""
-    with pdfplumber.open(io.BytesIO(page_bytes)) as pdf:
-        if len(pdf.pages) > 0:
-            text = pdf.pages[0].extract_text() or ""
-
-    if not text.strip():
-        text = pytesseract.image_to_string(pil_img)
-
-    text_lower = text.lower()
-
-    # Step 3: Document type classification
+    # Step 2: Document Categorization
+    text_lower = text_block.lower()
     doc_type = "Document"
     if "bbbe" in text_lower or "unemployment" in text_lower:
         doc_type = "BBBEE-Unemployment-Affidavit"
@@ -151,34 +110,21 @@ def process_single_page(page_bytes):
     elif "senior certificate" in text_lower:
         doc_type = "Senior-Certificate"
 
-    # Fallback name and ID patterns if spatial extraction didn't find them
-    if not cand_id:
-        id_match = re.search(r'\b(\d{13})\b', text)
-        if id_match:
-            cand_id = id_match.group(1)
-
-    if not cand_name:
-        fn_match = re.search(r'(?:Full\s*Names?|First\s*Names?)\s*[:\-\.]*\s*([^\n]+)', text, re.IGNORECASE)
-        if fn_match:
-            cand_name = clean_candidate_name(fn_match.group(1))
-
     return cand_name, cand_id, doc_type
 
+st.title("📄 Candidate Pack Processor (EasyOCR Engine)")
 
-# 4. Streamlit Application
-st.title("📄 Candidate Document Pack Processor")
-
-uploaded_files = st.file_uploader("Upload PDF Documents", type=["pdf"], accept_multiple_files=True)
+uploaded_files = st.file_uploader("Upload Candidate PDF Packs", type=["pdf"], accept_multiple_files=True)
 
 if uploaded_files and st.button("Process Documents"):
     records = []
     zip_buffer = io.BytesIO()
 
-    with st.spinner("Extracting candidate metadata..."):
+    with st.spinner("Analyzing handwriting via Deep Learning Neural Nets..."):
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
             for uploaded_file in uploaded_files:
-                reader = PdfReader(io.BytesIO(uploaded_file.getvalue()))
-                total_pages = len(reader.pages)
+                reader_pdf = PdfReader(io.BytesIO(uploaded_file.getvalue()))
+                total_pages = len(reader_pdf.pages)
 
                 pages_data = []
                 extracted_names = []
@@ -186,7 +132,7 @@ if uploaded_files and st.button("Process Documents"):
 
                 for p_idx in range(total_pages):
                     writer = PdfWriter()
-                    writer.add_page(reader.pages[p_idx])
+                    writer.add_page(reader_pdf.pages[p_idx])
 
                     p_io = io.BytesIO()
                     writer.write(p_io)
